@@ -282,3 +282,88 @@ def vote(pool: ConnectionPool, voter_no: str, applicant_no: str, yes: bool) -> D
             return decision
     except psycopg.errors.IntegrityError:
         return Decision(rules.REJECTED, f"{rules.TEAM_FULL}(다른 학생이 먼저 들어감)")
+
+
+# ---------- 관리자: 모집 마감 ----------
+
+def close_recruitment(pool: ConnectionPool) -> Decision:
+    """대기 중인 지원은 거절하고, 1명뿐인 팀의 학생은 팀에서 뺌(PRD 3.5절)."""
+    with pool.connection() as conn, conn.transaction():
+        conn.execute("select id from tf_teams order by id for update")  # 진행 중인 지원, 투표가 끝나기를 기다림
+        if _is_closed(conn):
+            return Decision(rules.BLOCKED, "이미 모집을 마감함")
+        rejected = conn.execute(
+            "update tf_applications set status = '거절', reason = %s, decided_at = now() where status = '대기'",
+            (rules.CLOSED,),
+        ).rowcount
+        removed = conn.execute(
+            "delete from tf_members where team_id in"
+            " (select team_id from tf_members group by team_id having count(*) = 1)"
+        ).rowcount
+        conn.execute(
+            "insert into tf_settings (key, value) values (%s, '1')"
+            " on conflict (key) do update set value = '1'",
+            (SETTING_CLOSED,),
+        )
+    return Decision(
+        rules.APPROVED, f"모집을 마감함(대기 중인 지원 {rejected}건 거절, 1명뿐인 팀에서 {removed}명 빠짐)"
+    )
+
+
+# ---------- 관리자: 배정안 저장, 확정, AI 기록 ----------
+
+SETTING_PROPOSAL = "proposal"
+
+
+def save_proposal(pool: ConnectionPool, proposal: list[tuple[str, int]], source: str) -> None:
+    value = json.dumps({"proposal": proposal, "source": source}, ensure_ascii=False)
+    with pool.connection() as conn:
+        conn.execute(
+            "insert into tf_settings (key, value) values (%s, %s)"
+            " on conflict (key) do update set value = excluded.value",
+            (SETTING_PROPOSAL, value),
+        )
+
+
+def load_proposal(pool: ConnectionPool) -> dict | None:
+    with pool.connection() as conn:
+        row = conn.execute("select value from tf_settings where key = %s", (SETTING_PROPOSAL,)).fetchone()
+    if row is None:
+        return None
+    data = json.loads(row["value"])
+    data["proposal"] = [(no, int(team)) for no, team in data["proposal"]]
+    return data
+
+
+def clear_proposal(pool: ConnectionPool) -> None:
+    with pool.connection() as conn:
+        conn.execute("delete from tf_settings where key = %s", (SETTING_PROPOSAL,))
+
+
+def confirm_proposal(pool: ConnectionPool) -> Decision:
+    """저장한 배정안을 지금의 DB 상태로 다시 검사한 뒤 팀원으로 기록함(PRD 3.7절)."""
+    saved = load_proposal(pool)
+    if saved is None:
+        return Decision(rules.BLOCKED, "확정할 배정안이 없음(먼저 AI 배정을 누름)")
+    board = load_board(pool)
+    problems = rules.validate_assignment(rules.Assignment(board.teams, board.unassigned(), saved["proposal"]))
+    if problems:
+        return Decision(rules.BLOCKED, "배정안이 지금 상태와 맞지 않음(" + "; ".join(problems[:3]) + ")")
+    try:
+        with pool.connection() as conn, conn.transaction():
+            conn.execute("select id from tf_teams order by id for update")
+            for student_no, team_no in saved["proposal"]:
+                student = _student(conn, student_no)
+                _add_member(conn, team_no, student["id"])
+            conn.execute("delete from tf_settings where key = %s", (SETTING_PROPOSAL,))
+    except psycopg.errors.IntegrityError:
+        return Decision(rules.BLOCKED, "확정하는 동안 팀 구성이 바뀜(다시 AI 배정을 누름)")
+    return Decision(rules.APPROVED, f"배정안을 확정함({len(saved['proposal'])}명 배정, {saved['source']})")
+
+
+def log_attempt(pool: ConnectionPool, run_id: str, order: int, model: str, outcome: str, elapsed: float) -> None:
+    with pool.connection() as conn:
+        conn.execute(
+            "insert into tf_ai_logs (run_id, attempt_no, model, outcome, elapsed_sec) values (%s, %s, %s, %s, %s)",
+            (run_id, order, model, outcome[:500], elapsed),
+        )

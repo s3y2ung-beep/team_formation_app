@@ -5,9 +5,11 @@
 같은 실행에서 바뀐 상태와 결과 안내(result)가 바로 보임.
 """
 
+import time
+
 import streamlit as st
 
-from teamapp import config, db, roster, rules, service
+from teamapp import ai, config, db, roster, rules, service, solver
 
 st.set_page_config(page_title="팀 편성", page_icon="👥", layout="wide")
 
@@ -228,31 +230,159 @@ def on_start() -> None:
         return
     team_count = int(st.session_state.get("admin_team_count") or 0)
     set_result(service.reset_board(get_pool(), students, team_count).message)
+    st.session_state.pop("assign_report", None)
+
+
+def on_close() -> None:
+    if require_admin():
+        set_result(service.close_recruitment(get_pool()).message)
+
+
+def on_confirm() -> None:
+    if require_admin():
+        set_result(service.confirm_proposal(get_pool()).message)
+        st.session_state.pop("assign_report", None)
 
 
 @st.fragment(run_every=REFRESH_SECONDS)
 def admin_board() -> None:
-    """관리자 화면의 바뀌는 부분(팀 목록과 대기 지원)."""
+    """관리자 화면의 바뀌는 부분(팀이 없는 학생, 팀 목록)."""
     board = service.load_board(get_pool())
     st.markdown(
         f"학생 {len(board.students)}명 · 팀 {len(board.teams)}개 · 대기 중인 지원 {len(board.pending)}건"
         + (" · 🔒 모집이 마감됨" if board.closed else " · 모집 중")
     )
+    st.subheader("팀이 없는 학생")
+    with st.container(key="unassigned", border=True):
+        left = board.unassigned()
+        if left:
+            for s in left:
+                st.markdown(f"- {student_line(s)}")
+        else:
+            st.caption("팀이 없는 학생이 없음")
     st.subheader("팀 목록")
     for col, team_no in grid(sorted(board.teams)):
         with col:
             team_card(board, team_no)
 
 
+def proposal_table(board: service.Board, proposal: list[tuple[str, int]]) -> None:
+    rows = []
+    for student_no, team_no in proposal:
+        s = board.students.get(student_no)
+        rows.append({
+            "이름": s.name if s else student_no,
+            "주 역할": s.main_role if s else "",
+            "보조 역할": ", ".join(s.sub_roles) if s and s.sub_roles else "없음",
+            "배정된 팀": board.team_names.get(team_no, f"팀{team_no}"),
+        })
+    st.dataframe(rows, hide_index=True, width="stretch")
+
+
+def attempts_table(attempts: list[dict]) -> None:
+    if attempts:
+        st.markdown("**모델별 시도 결과**")
+        st.dataframe(attempts, hide_index=True, width="stretch")
+
+
+def run_ai_assign(status_box) -> None:
+    """AI 배정. 기다리는 동안 몇 차 모델의 응답을 기다리는지 assign_status에 보여 줌."""
+    pool = get_pool()
+    service.clear_proposal(pool)
+    st.session_state.pop("assign_report", None)
+    board = service.load_board(pool)
+    if not board.closed:
+        set_result("막힘: 먼저 모집을 마감해야 함")
+        return
+    unassigned = board.unassigned()
+
+    # 1. 규칙을 지키는 배정이 있는지 모든 경우를 따져 먼저 확인함. 없으면 AI를 부르지 않음
+    if solver.find_assignment(board.teams, unassigned) is None:
+        reasons = solver.explain_impossible(board.teams, unassigned)
+        st.session_state["assign_report"] = {"impossible": reasons}
+        set_result("막힘: 규칙을 지키는 배정이 없음")
+        return
+    if not unassigned:
+        set_result("막힘: 팀이 없는 학생이 없어 배정할 것이 없음")
+        return
+
+    # 2. 1차, 2차, 3차 모델을 차례로 부름
+    run_id = time.strftime("%Y%m%d-%H%M%S")
+    with status_box:
+        progress = st.empty()
+        done_box = st.container()
+
+    def on_progress(order: int, model: str, elapsed: float) -> None:
+        progress.info(
+            f"⏳ {order}차 모델 응답 기다리는 중: `{model}` · {elapsed:.0f}초 경과 / {ai.MODEL_TIMEOUT}초"
+        )
+
+    def on_attempt(a: ai.Attempt) -> None:
+        service.log_attempt(pool, run_id, a.order, a.model, a.outcome, a.elapsed)
+        icon = "✅" if a.outcome == "성공" else "❌"
+        done_box.markdown(f"{icon} {a.order}차 `{a.model}`: {a.outcome} ({a.elapsed:.0f}초)")
+
+    result = ai.run_assignment(
+        board.teams, unassigned, config.get_secret("OPENROUTER_API_KEY"),
+        on_progress=on_progress, on_attempt=on_attempt,
+    )
+    progress.empty()
+    attempts = [
+        {"차례": f"{a.order}차", "모델": a.model, "결과": a.outcome, "걸린 시간(초)": a.elapsed}
+        for a in result.attempts
+    ]
+    if not result.proposal:
+        st.session_state["assign_report"] = {"attempts": attempts}
+        set_result("막힘: 배정안을 만들지 못함")
+        return
+    service.save_proposal(pool, result.proposal, result.source)
+    st.session_state["assign_report"] = {"attempts": attempts}
+    set_result(f"승인: 배정안을 만듦({result.source}). 확인한 뒤 확정을 누름")
+
+
+def show_assign_report(status_box) -> None:
+    """마지막 AI 배정의 결과를 assign_status 안에 보여 줌."""
+    report = st.session_state.get("assign_report") or {}
+    saved = service.load_proposal(get_pool())
+    with status_box:
+        if report.get("impossible"):
+            st.error("규칙을 지키는 배정이 없음")
+            for reason in report["impossible"]:
+                st.markdown(f"- {reason}")
+            st.caption("이때는 AI를 부르지 않음")
+        attempts_table(report.get("attempts", []))
+        if saved:
+            st.success(f"배정안(배정안을 낸 곳: {saved['source']}). 다섯 가지 검사를 통과함")
+            proposal_table(service.load_board(get_pool()), saved["proposal"])
+        elif not report:
+            st.caption("모집을 마감한 뒤 AI 배정을 누름. 1차, 2차, 3차 모델이 모두 실패하면 앱이 직접 배정함")
+
+
 def admin_view() -> None:
     st.title("관리자 화면")
-    show_result()
+    result_slot = st.container()
 
     with st.expander("1. 명단으로 처음 상태 만들기", expanded=True):
         st.file_uploader("명단 CSV 파일", type=["csv"], key="admin_roster_file")
         st.number_input("팀 수", min_value=1, max_value=20, value=3, step=1, key="admin_team_count")
         st.button("명단으로 처음 상태 만들기", key="admin_start", on_click=on_start, type="primary")
         st.caption("누르면 지원, 투표, 팀원, 마감 표시가 모두 지워짐. 관리자 계정은 남음")
+
+    st.subheader("2. 모집 마감과 AI 배정")
+    c1, c2 = st.columns(2)
+    c1.button("모집 마감", key="admin_close", on_click=on_close, width="stretch")
+    assign_clicked = c2.button("AI 배정", key="admin_assign", width="stretch")
+    status_box = st.container(key="assign_status", border=True)
+    if assign_clicked and require_admin():
+        run_ai_assign(status_box)
+    show_assign_report(status_box)
+    # 확정 단추는 검사를 통과한 배정안이 있을 때만 보여 줌(AI를 기다리는 동안 누를 수 없게)
+    if service.load_proposal(get_pool()):
+        st.button("배정안 확정", key="admin_confirm", on_click=on_confirm, type="primary", width="stretch")
+
+    # 결과 안내는 AI 배정처럼 이 실행 안에서 끝나는 동작의 결과까지 담도록 맨 마지막에 채움
+    with result_slot:
+        show_result()
 
     admin_board()
 
