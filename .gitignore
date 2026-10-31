@@ -1,0 +1,14 @@
+# 키와 비밀번호가 든 파일은 깃허브에 올리지 않음
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# 파이썬 가상 환경과 캐시
+.venv/
+__pycache__/
+.pytest_cache/
+
+# 운영체제가 만드는 파일
+.DS_Store
+Thumbs.db
