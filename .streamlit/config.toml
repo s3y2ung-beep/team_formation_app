@@ -1,0 +1,6 @@
+# 오류가 나도 화면에는 오류 종류만 보여 주고, 메시지와 코드 위치(DB 주소가 섞일 수 있음)는 보여 주지 않음
+[client]
+showErrorDetails = "type"
+
+[browser]
+gatherUsageStats = false
