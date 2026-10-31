@@ -1,13 +1,17 @@
 """팀 프로젝트 팀 편성 웹 앱(Streamlit).
 
 화면 요소의 key는 공고 2.7절의 표를 그대로 따름. 자동 채점 프로그램이 key로 요소를 찾기 때문임.
+단추의 동작은 on_click 콜백에서 처리함. 콜백은 화면을 그리기 전에 실행되므로,
+같은 실행에서 바뀐 상태와 결과 안내(result)가 바로 보임.
 """
 
 import streamlit as st
 
-from teamapp import config, db
+from teamapp import config, db, roster, rules, service
 
 st.set_page_config(page_title="팀 편성", page_icon="👥", layout="wide")
+
+REFRESH_SECONDS = 3  # 다른 사람의 변경을 다시 그리는 간격(공고: 5초 이하)
 
 
 @st.cache_resource(show_spinner="DB에 연결하는 중")
@@ -37,6 +41,36 @@ def show_result() -> None:
             st.info(message)
         else:
             st.error(message)
+
+
+# ---------- 공통 표시 ----------
+
+def student_line(s: rules.Student) -> str:
+    subs = ", ".join(s.sub_roles) if s.sub_roles else "없음"
+    return f"**{s.name}** · 주 역할 {s.main_role} · 보조 역할 {subs}"
+
+
+def team_card(board: service.Board, team_no: int, my_team: int | None = None) -> None:
+    """팀 하나의 표시(key: team_N). 팀원의 이름과 주 역할, 보조 역할을 보여 줌."""
+    members = board.teams[team_no]
+    with st.container(key=f"team_{team_no}", border=True):
+        mark = " · 🟢 내 팀" if team_no == my_team else ""
+        st.markdown(f"#### {board.team_names[team_no]}{mark}  \n{len(members)}/{rules.MAX_TEAM}명")
+        if members:
+            for m in members:
+                st.markdown(f"- {student_line(m)}")
+        else:
+            st.caption("아직 팀원이 없음")
+        waiting = [p for p in board.pending if p.team_no == team_no]
+        if waiting:
+            st.caption("지원 대기: " + ", ".join(p.applicant.name for p in waiting))
+
+
+def grid(items: list, columns: int = 2):
+    """항목을 columns개씩 나란히 놓을 열을 차례로 돌려줌."""
+    cols = st.columns(columns)
+    for i, item in enumerate(items):
+        yield cols[i % columns], item
 
 
 # ---------- 로그인 ----------
@@ -87,18 +121,140 @@ def header(user: dict) -> None:
             st.rerun()
 
 
-# ---------- 화면 ----------
+# ---------- 학생 화면 ----------
 
-def admin_view(pool, user: dict) -> None:
+def on_apply(student_no: str, team_no: int) -> None:
+    decision = service.apply(get_pool(), student_no, team_no)
+    set_result(f"{decision.message} (팀{team_no} 지원)")
+
+
+def on_vote(voter_no: str, applicant_no: str, applicant_name: str, yes: bool) -> None:
+    decision = service.vote(get_pool(), voter_no, applicant_no, yes)
+    choice = "찬성" if yes else "거부"
+    set_result(f"{decision.message} ({applicant_name}의 지원에 {choice})")
+
+
+def my_status_text(board: service.Board, me: str) -> str:
+    team_no = board.team_of.get(me)
+    if team_no:
+        return f"내 팀: {board.team_names[team_no]}"
+    pending = board.pending_of(me)
+    if pending:
+        voted = sum(1 for v in pending.votes.values() if v == "찬성")
+        total = len(board.teams[pending.team_no])
+        return f"아직 팀이 없음 · {board.team_names[pending.team_no]}에 지원함(대기, 찬성 {voted}/{total})"
+    last = board.my_last
+    if last and last["status"] == rules.REJECTED:
+        return f"아직 팀이 없음 · 지난 지원은 거절됨({last['reason']})"
+    return "아직 팀이 없음"
+
+
+@st.fragment(run_every=REFRESH_SECONDS)
+def student_board(me: str) -> None:
+    """학생 화면의 바뀌는 부분. 3초마다 이 부분만 다시 그려 다른 사람의 지원과 투표를 보여 줌."""
+    board = service.load_board(get_pool(), me)
+    show_result()
+    my_team = board.team_of.get(me)
+    my_pending = board.pending_of(me)
+    can_apply = not board.closed and my_team is None and my_pending is None
+
+    st.markdown(f"**{my_status_text(board, me)}**" + ("  · 🔒 모집이 마감됨" if board.closed else ""))
+
+    st.subheader("팀 목록")
+    for col, team_no in grid(sorted(board.teams)):
+        with col:
+            team_card(board, team_no, my_team)
+            st.button(
+                f"{board.team_names[team_no]}에 지원",
+                key=f"apply_{team_no}",
+                disabled=not can_apply,
+                on_click=on_apply,
+                args=(me, team_no),
+                width="stretch",
+            )
+
+    if my_team is not None:
+        st.subheader("내 팀에 들어온 지원")
+        incoming = [p for p in board.pending if p.team_no == my_team]
+        if not incoming:
+            st.caption("대기 중인 지원이 없음")
+        for p in incoming:
+            with st.container(border=True):
+                yes_count = sum(1 for v in p.votes.values() if v == "찬성")
+                st.markdown(f"{student_line(p.applicant)}  \n찬성 {yes_count}/{len(board.teams[my_team])}")
+                my_vote = p.votes.get(me)
+                if my_vote:
+                    st.markdown(f"내 투표: {my_vote}")
+                elif not board.closed:
+                    no = p.applicant.student_no
+                    yes_col, no_col = st.columns(2)
+                    yes_col.button(
+                        "찬성", key=f"vote_yes_{no}", on_click=on_vote,
+                        args=(me, no, p.applicant.name, True), width="stretch",
+                    )
+                    no_col.button(
+                        "거부", key=f"vote_no_{no}", on_click=on_vote,
+                        args=(me, no, p.applicant.name, False), width="stretch",
+                    )
+
+
+def student_view(user: dict) -> None:
+    st.title("학생 화면")
+    student_board(user["student_no"])
+
+
+# ---------- 관리자 화면 ----------
+
+def require_admin() -> bool:
+    """관리자 기능은 화면이 아니라 서버에서 다시 확인함(학생 계정으로 쓸 수 없게)."""
+    user = db.find_user(get_pool(), st.session_state.get("user_no", ""))
+    if user is None or not user["is_admin"]:
+        set_result("막힘: 관리자만 할 수 있음")
+        return False
+    return True
+
+
+def on_start() -> None:
+    if not require_admin():
+        return
+    uploaded = st.session_state.get("admin_roster_file")
+    if uploaded is None:
+        set_result("막힘: 명단 CSV 파일을 올리지 않음")
+        return
+    try:
+        students = roster.parse_roster(uploaded.getvalue())
+    except roster.RosterError as e:
+        set_result(f"막힘: 명단 파일이 틀림({e})")
+        return
+    team_count = int(st.session_state.get("admin_team_count") or 0)
+    set_result(service.reset_board(get_pool(), students, team_count).message)
+
+
+@st.fragment(run_every=REFRESH_SECONDS)
+def admin_board() -> None:
+    """관리자 화면의 바뀌는 부분(팀 목록과 대기 지원)."""
+    board = service.load_board(get_pool())
+    st.markdown(
+        f"학생 {len(board.students)}명 · 팀 {len(board.teams)}개 · 대기 중인 지원 {len(board.pending)}건"
+        + (" · 🔒 모집이 마감됨" if board.closed else " · 모집 중")
+    )
+    st.subheader("팀 목록")
+    for col, team_no in grid(sorted(board.teams)):
+        with col:
+            team_card(board, team_no)
+
+
+def admin_view() -> None:
     st.title("관리자 화면")
     show_result()
-    st.caption("명단 올리기, 모집 마감, AI 배정은 다음 단계에서 만듦")
 
+    with st.expander("1. 명단으로 처음 상태 만들기", expanded=True):
+        st.file_uploader("명단 CSV 파일", type=["csv"], key="admin_roster_file")
+        st.number_input("팀 수", min_value=1, max_value=20, value=3, step=1, key="admin_team_count")
+        st.button("명단으로 처음 상태 만들기", key="admin_start", on_click=on_start, type="primary")
+        st.caption("누르면 지원, 투표, 팀원, 마감 표시가 모두 지워짐. 관리자 계정은 남음")
 
-def student_view(pool, user: dict) -> None:
-    st.title("학생 화면")
-    show_result()
-    st.caption("팀 목록, 지원, 투표는 다음 단계에서 만듦")
+    admin_board()
 
 
 def main() -> None:
@@ -116,9 +272,9 @@ def main() -> None:
         return
     header(user)
     if user["is_admin"]:
-        admin_view(pool, user)
+        admin_view()
     else:
-        student_view(pool, user)
+        student_view(user)
 
 
 main()
