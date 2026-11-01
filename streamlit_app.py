@@ -5,7 +5,7 @@
 같은 실행에서 바뀐 상태와 결과 안내(result)가 바로 보임.
 """
 
-import time
+from datetime import datetime, timedelta, timezone
 
 import streamlit as st
 
@@ -14,6 +14,7 @@ from teamapp import ai, config, db, roster, rules, service, solver
 st.set_page_config(page_title="팀 편성", page_icon="👥", layout="wide")
 
 REFRESH_SECONDS = 3  # 다른 사람의 변경을 다시 그리는 간격(공고: 5초 이하)
+KST = timezone(timedelta(hours=9))  # 배포 서버의 시계는 UTC이므로 시각은 한국 시각으로 바꿔 씀
 
 
 @st.cache_resource(show_spinner="DB에 연결하는 중")
@@ -307,7 +308,7 @@ def run_ai_assign(status_box) -> None:
         return
 
     # 2. 1차, 2차, 3차 모델을 차례로 부름
-    run_id = time.strftime("%Y%m%d-%H%M%S")
+    run_id = datetime.now(KST).strftime("%Y%m%d-%H%M%S")
     with status_box:
         progress = st.empty()
         done_box = st.container()
