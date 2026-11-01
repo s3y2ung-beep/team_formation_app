@@ -1,6 +1,7 @@
-streamlit>=1.50
-psycopg[binary]>=3.2
-psycopg_pool>=3.2
-bcrypt>=4.2
-requests>=2.32
-python-dotenv>=1.0
+# 채점 때 시험하지 않은 새 버전이 깔리지 않도록, Python 3.12와 3.14에서 시험을 통과한 버전으로 고정함
+streamlit==1.66.1
+psycopg[binary]==3.3.6
+psycopg_pool==3.3.3
+bcrypt==5.0.0
+requests==2.34.2
+python-dotenv==1.2.4
